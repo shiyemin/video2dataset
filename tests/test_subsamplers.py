@@ -1,4 +1,5 @@
 """test video2dataset subsamplers"""
+import json
 import os
 import subprocess
 import pytest
@@ -22,7 +23,8 @@ from video2dataset.subsamplers import (
 )
 
 
-SINGLE = [[50.0, 60.0]]
+SINGLE_FLOAT = [[50.0, 60.0]]
+SINGLE_TIME = [["00:00:50.000", "00:01:00.000"]]
 MULTI = [
     ["00:00:09.000", "00:00:13.500"],
     ["00:00:13.600", "00:00:24.000"],
@@ -32,8 +34,20 @@ MULTI = [
 ]
 
 
-@pytest.mark.parametrize("clips", [SINGLE, MULTI])
-def test_clipping_subsampler(clips):
+@pytest.mark.parametrize(
+    "clips_value, clip_targets, min_length, max_length, expected_fragments, expect_serialized",
+    [
+        (SINGLE_FLOAT, SINGLE_FLOAT, 2.0, 3.0, 3, False),
+        (json.dumps(SINGLE_FLOAT), SINGLE_FLOAT, 2.0, 3.0, 3, True),
+        (SINGLE_TIME, SINGLE_TIME, 2.0, 3.0, 3, False),
+        (json.dumps(SINGLE_TIME), SINGLE_TIME, 2.0, 3.0, 3, True),
+        (MULTI, MULTI, 5.0, 999999.0, 4, False),
+        (json.dumps(MULTI), MULTI, 5.0, 999999.0, 4, True),
+    ],
+)
+def test_clipping_subsampler(
+    clips_value, clip_targets, min_length, max_length, expected_fragments, expect_serialized
+):
     current_folder = os.path.dirname(__file__)
     # video lenght - 2:02
     video = os.path.join(current_folder, "test_files/test_video.mp4")
@@ -43,8 +57,6 @@ def test_clipping_subsampler(clips):
     with open(audio, "rb") as aud_f:
         audio_bytes = aud_f.read()
 
-    min_length = 5.0 if clips == MULTI else 2.0
-    max_length = 999999.0 if clips == MULTI else 3.0
     subsampler = ClippingSubsampler(
         oom_clip_count=3,
         encode_formats={"video": "mp4", "audio": "mp3"},
@@ -56,7 +68,7 @@ def test_clipping_subsampler(clips):
 
     metadata = {
         "key": "000",
-        "clips": clips,
+        "clips": clips_value,
     }
 
     streams: Streams = {"video": [video_bytes], "audio": [audio_bytes]}
@@ -66,29 +78,38 @@ def test_clipping_subsampler(clips):
     assert error_message is None
     # first one is only 4.5s
     assert len(audio_fragments) == len(video_fragments) == len(meta_fragments)
-    if clips == SINGLE:
-        assert len(video_fragments) == 3
-    else:
-        assert len(video_fragments) == 4
+    assert len(video_fragments) == expected_fragments
+
+    expected_spans = []
+    for s_target, e_target in clip_targets:
+        s_target_sec, e_target_sec = _get_seconds(s_target), _get_seconds(e_target)
+        expected_spans.extend(_split_time_frame(s_target_sec, e_target_sec, min_length, max_length))
+
+    assert len(expected_spans) == expected_fragments
+
+    expected_span_tuples = [
+        (round(span[0], 3), round(span[1], 3)) for span in expected_spans
+    ]
 
     for vid_frag, meta_frag in zip(video_fragments, meta_fragments):
         with tempfile.NamedTemporaryFile() as tmp:
             tmp.write(vid_frag)
-            key_ind = int(meta_frag["key"].split("_")[-1])
-            s, e = meta_frag["clips"][0]
-
-            if clips == MULTI:
-                key_ind += 1
+            clips_field = meta_frag["clips"]
+            if expect_serialized:
+                assert isinstance(clips_field, str)
+                clips_list = json.loads(clips_field)
             else:
-                key_ind = 0
+                assert isinstance(clips_field, list)
+                clips_list = clips_field
 
-            s_target, e_target = clips[key_ind]
-            s_target, e_target = _get_seconds(s_target), _get_seconds(e_target)
-            expected_clips = _split_time_frame(s_target, e_target, min_length, max_length)
-            assert [_get_seconds(s), _get_seconds(e)] in expected_clips
-            assert _get_seconds(e) - _get_seconds(s) >= min_length
-
+            s, e = clips_list[0]
             s_s, e_s = _get_seconds(s), _get_seconds(e)
+            span_tuple = (round(s_s, 3), round(e_s, 3))
+
+            assert span_tuple in expected_span_tuples
+            expected_span_tuples.remove(span_tuple)
+            assert (e_s - s_s) >= (min_length - 1e-6)
+
             probe = ffmpeg.probe(tmp.name)
             video_stream = [stream for stream in probe["streams"] if stream["codec_type"] == "video"][0]
             frag_len = float(video_stream["duration"])

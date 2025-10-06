@@ -2,10 +2,12 @@
 clipping subsampler turns full videos into clips of videos according to clip_col
 """
 from collections.abc import Iterable
+import ast
 import copy
 import datetime
 import ffmpeg
 import glob
+import json
 import os
 import tempfile
 from typing import Any, Union, List, Tuple, Dict, Literal, cast
@@ -15,6 +17,31 @@ from video2dataset.types import EncodeFormats, Streams
 
 
 ClipSpan = List[float]  # [start, end]
+
+
+def _parse_clip_spans_input(clip_spans: Union[List[ClipSpan], ClipSpan, str, bytes]) -> Any:
+    """Normalizes clip spans read from metadata into python structures"""
+    current = clip_spans
+
+    if isinstance(current, (bytes, bytearray)):
+        current = current.decode("utf-8")
+
+    if isinstance(current, str):
+        stripped = current.strip()
+        if not stripped:
+            return []
+        try:
+            current = json.loads(stripped)
+        except json.JSONDecodeError:
+            try:
+                current = ast.literal_eval(stripped)
+            except (ValueError, SyntaxError) as exc:  # pragma: no cover - unexpected input
+                raise ValueError(f"Unable to parse clip spans string: {clip_spans}") from exc
+
+    if isinstance(current, tuple):
+        current = list(current)
+
+    return current
 
 
 def _get_seconds(t: Union[str, float]) -> float:
@@ -60,15 +87,28 @@ def _adjust_clip_spans_to_keyframes(clip_spans: List[ClipSpan], keyframes: List[
 
 
 def _adjust_clip_spans(
-    clip_spans: List[ClipSpan],
+    clip_spans: Union[List[ClipSpan], ClipSpan, str, bytes],
     keyframe_timestamps: Union[List[float], None],
     min_length: float,
     max_length: float,
     max_length_strategy: str,
 ) -> List[ClipSpan]:
     """Adjusts cut times around keyframes, filtering by min and max length"""
-    if not isinstance(clip_spans[0], Iterable):  # make sure clip_spans looks like [[start, end]] and not [start, end]
+    clip_spans = _parse_clip_spans_input(clip_spans)
+
+    if clip_spans is None:
+        return []
+
+    if not isinstance(clip_spans, list):
         clip_spans = cast(List[ClipSpan], [clip_spans])
+
+    if len(clip_spans) == 0:
+        return []
+
+    # make sure clip_spans looks like [[start, end]] even if it was originally [start, end]
+    if not isinstance(clip_spans[0], Iterable) or isinstance(clip_spans[0], (str, bytes)):
+        clip_spans = cast(List[ClipSpan], [clip_spans])
+
     clip_spans = [[_get_seconds(s), _get_seconds(e)] for [s, e] in clip_spans]
 
     if keyframe_timestamps:
@@ -157,6 +197,7 @@ def _get_clip_metadata(
     metadata: dict,
     oom_clip_count: int,
     strtime_formatting: bool,
+    serialize_clip_spans: bool,
 ) -> List[dict]:
     """Gets metadata for each clip"""
     metadata_clips = []
@@ -171,6 +212,8 @@ def _get_clip_metadata(
             meta_clip["clips"] = [(_get_strtime(clip_span[0]), _get_strtime(clip_span[1]))]
         else:
             meta_clip["clips"] = [clip_span]
+        if serialize_clip_spans:
+            meta_clip["clips"] = json.dumps(meta_clip["clips"], ensure_ascii=False)
         meta_clip["key"] = f"{meta_clip['key']}_{clip_key}"
 
         yt_md_dict = meta_clip.get("yt_meta_dict", {})
@@ -193,6 +236,7 @@ def _get_clips(
     metadata: dict,
     oom_clip_count: int,
     strtime_formatting: bool,
+    serialize_clip_spans: bool,
 ) -> Tuple[Dict[str, List[bytes]], List[dict]]:
     """Gets clips from streams"""
     clip_times, clip_idxs = _collate_clip_spans(clip_spans)
@@ -237,6 +281,7 @@ def _get_clips(
         metadata=metadata,
         oom_clip_count=oom_clip_count,
         strtime_formatting=strtime_formatting,
+        serialize_clip_spans=serialize_clip_spans,
     )
 
     return clips, clip_metadata
@@ -288,10 +333,20 @@ class ClippingSubsampler(Subsampler):
         self.precision = precision
 
     def __call__(self, streams: Streams, metadata: dict):
-        strtime_formatting = isinstance(metadata["clips"][0][0], str)
+        raw_clip_spans = metadata.pop("clips")
+        parsed_clip_spans = _parse_clip_spans_input(raw_clip_spans)
+
+        strtime_formatting = False
+        if (
+            isinstance(parsed_clip_spans, list)
+            and parsed_clip_spans
+            and isinstance(parsed_clip_spans[0], Iterable)
+            and parsed_clip_spans[0]
+        ):
+            strtime_formatting = isinstance(parsed_clip_spans[0][0], str)
 
         clip_spans = _adjust_clip_spans(
-            clip_spans=metadata.pop("clips"),
+            clip_spans=parsed_clip_spans,
             keyframe_timestamps=(
                 # TODO: make it so if keyframe timestamps not present, get it yourself
                 metadata["video_metadata"].pop("keyframe_timestamps")
@@ -305,6 +360,8 @@ class ClippingSubsampler(Subsampler):
         if len(clip_spans) == 0:
             return {}, [], f"Video had no clip_spans longer than {self.min_length}"
 
+        serialize_clip_spans = isinstance(raw_clip_spans, (str, bytes))
+
         try:
             clips, clip_metadata = _get_clips(
                 streams=streams,
@@ -314,6 +371,7 @@ class ClippingSubsampler(Subsampler):
                 metadata=metadata,
                 oom_clip_count=self.oom_clip_count,
                 strtime_formatting=strtime_formatting,
+                serialize_clip_spans=serialize_clip_spans,
             )
         except Exception as err:  # pylint: disable=broad-except
             return {}, [], str(err)
